@@ -1,0 +1,72 @@
+[project]
+name = "dike-defect-detection"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.4.1",
+    "opencv-python-headless>=4.13.0.92",
+    "pillow>=12.1.0",
+    "scikit-image>=0.26.0",
+    "tenacity>=9.1.4",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
+
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.1.0",
+    "prek>=0.3.4",
+    "pyrefly>=0.55.0",
+    "pytest>=9.0.2",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.15.4",
+]
+
+
+[tool.pyrefly]
+project-includes = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+fix = true
+
+[tool.ruff.lint]
+select = [
+    # https://docs.astral.sh/ruff/rules/#pyflakes-f
+    "F", # Pyflakes
+    # https://docs.astral.sh/ruff/rules/#pycodestyle-e-w
+    "E", # pycodestyle
+    "W", # Warning
+    # https://docs.astral.sh/ruff/rules/#flake8-comprehensions-c4
+    # https://docs.astral.sh/ruff/rules/#mccabe-c90
+    # "C", # Complexity (mccabe+) & comprehensions
+    # https://docs.astral.sh/ruff/rules/#pyupgrade-up
+    "UP", # pyupgrade
+    # https://docs.astral.sh/ruff/rules/#isort-i
+    "I", # isort
+]
+ignore = [
+    # https://docs.astral.sh/ruff/rules/#pycodestyle-e-w
+    "E402", # module level import not at top of file
+    # https://docs.astral.sh/ruff/rules/#pyupgrade-up
+    "UP006", # use-pep585-annotation
+    "UP007", # use-pep604-annotation
+    "E741",  # Ambiguous variable name
+    # "UP035", # deprecated-assertion
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "double"
+skip-magic-trailing-comma = false
+line-ending = "auto"

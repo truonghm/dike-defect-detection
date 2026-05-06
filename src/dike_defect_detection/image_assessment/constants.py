@@ -1,0 +1,11 @@
+"""Constants for reusable image assessment routines."""
+
+DAY_START_HOUR = 5
+DAY_END_HOUR = 19
+NIGHT_MEDIAN_THRESHOLD = 60.0
+NIGHT_DARK_RATIO_THRESHOLD = 0.65
+DARK_PIXEL_THRESHOLD = 50
+IMAGE_WIDTH = 1920
+IMAGE_HEIGHT = 1080
+IMAGE_EXTENSIONS = frozenset({".jpeg", ".jpg", ".png"})
+BLUR_THRESHOLD = 0.255154

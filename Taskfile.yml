@@ -1,0 +1,8 @@
+# https://taskfile.dev
+
+version: '3'
+
+tasks:
+  tree:
+    cmds:
+      - uv run scripts/tree.py -f -ms 2 -st 10 -l 4 {{.CLI_ARGS}}

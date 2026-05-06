@@ -10,6 +10,7 @@ from dike_defect_detection.image_assessment.day_night import (
     assess_day_night_from_image_bytes,
     get_time_tag,
 )
+from dike_defect_detection.image_assessment.metadata import load_image_tag_metadata
 from dike_defect_detection.image_assessment.resolution import (
     ResolutionAssessment,
     assess_resolution,
@@ -24,4 +25,5 @@ __all__ = [
     "assess_day_night_from_image_bytes",
     "assess_resolution",
     "get_time_tag",
+    "load_image_tag_metadata",
 ]

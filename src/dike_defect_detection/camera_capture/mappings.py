@@ -29,6 +29,8 @@ class CameraSite:
         Province name after the 2025 administrative changes.
     default_channel: int
         Default KBVISION channel to request from the snapshot endpoint.
+    is_active: bool
+        Whether this site is included when capturing all configured sites.
     """
 
     camera_key: str
@@ -37,6 +39,7 @@ class CameraSite:
     old_province_name: str
     new_province_name: str
     default_channel: int = 1
+    is_active: bool = True
 
 
 OLD_PROVINCE_ABBR: dict[str, str] = {
@@ -159,6 +162,13 @@ def _get_default_channel(raw_site: Mapping[str, object], site_index: int) -> int
     return raw_value
 
 
+def _get_is_active(raw_site: Mapping[str, object], site_index: int) -> bool:
+    raw_value = raw_site.get("is_active", True)
+    if not isinstance(raw_value, bool):
+        raise ValueError(f"Site #{site_index} field is_active must be a boolean")
+    return raw_value
+
+
 def _parse_camera_site(raw_site: Mapping[str, object], site_index: int) -> CameraSite:
     camera_key = _require_str(raw_site, "camera_key", site_index)
     base_url = _require_str(raw_site, "base_url", site_index)
@@ -166,6 +176,7 @@ def _parse_camera_site(raw_site: Mapping[str, object], site_index: int) -> Camer
     old_province_name = _require_str(raw_site, "old_province_name", site_index)
     new_province_name = _require_str(raw_site, "new_province_name", site_index)
     default_channel = _get_default_channel(raw_site, site_index)
+    is_active = _get_is_active(raw_site, site_index)
 
     if old_province_name not in OLD_PROVINCE_ABBR:
         raise ValueError(f"Site {camera_key} has unknown old_province_name: {old_province_name}")
@@ -179,6 +190,7 @@ def _parse_camera_site(raw_site: Mapping[str, object], site_index: int) -> Camer
         old_province_name=old_province_name,
         new_province_name=new_province_name,
         default_channel=default_channel,
+        is_active=is_active,
     )
 
 
@@ -257,9 +269,9 @@ def get_camera_filename_prefix(
     Examples
     --------
     >>> get_camera_filename_prefix("ketanthanh")
-    'TB-KTT'
+    'TB-ketanthanh'
     >>> get_camera_filename_prefix("ketanthanh", old_province_abbr=False)
-    'HY-KTT'
+    'HY-ketanthanh'
     """
 
     resolved_camera_sites = load_camera_sites() if camera_sites is None else camera_sites

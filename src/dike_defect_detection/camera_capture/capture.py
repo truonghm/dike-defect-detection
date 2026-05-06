@@ -7,6 +7,7 @@ import csv
 import os
 import sys
 from collections.abc import Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,7 @@ from dike_defect_detection.camera_capture.constants import (
     CAMERA_PASSWORD_ENV_VAR,
     CAMERA_SITE_CONFIG_PATH,
     CAMERA_USERNAME_ENV_VAR,
+    CAPTURE_WORKERS,
     LOG_FILENAME,
     OUTPUT_DIR,
     RETRY_ATTEMPTS,
@@ -52,7 +54,6 @@ from dike_defect_detection.image_assessment.constants import (
     NIGHT_MEDIAN_THRESHOLD,
 )
 from dike_defect_detection.image_assessment.day_night import (
-    DayNightImageAssessment,
     DayNightTag,
     assess_day_night_from_image_bytes,
     get_time_tag,
@@ -98,23 +99,32 @@ class CaptureCredentials:
 
 
 class SnapshotRetryableError(RuntimeError):
-    """Retryable snapshot failure during fetch or image validation."""
+    """Retryable snapshot failure during fetch."""
 
 
 @dataclass(frozen=True, slots=True)
-class SnapshotAssessment:
-    """Fetched snapshot bytes and reusable D/N assessment.
+class RawSnapshotCapture:
+    """Raw snapshot bytes and capture metadata before image assessment.
 
     Parameters
     ----------
+    camera_key: str
+        Key in the camera site config.
+    camera_site: CameraSite
+        Camera endpoint metadata.
+    channel: int
+        Snapshot channel.
+    captured_at: datetime
+        Local timestamp captured before the snapshot request.
     image_bytes: bytes
         Raw snapshot image bytes.
-    day_night_assessment: DayNightImageAssessment
-        Image-content-derived day/night assessment.
     """
 
+    camera_key: str
+    camera_site: CameraSite
+    channel: int
+    captured_at: datetime
     image_bytes: bytes
-    day_night_assessment: DayNightImageAssessment
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,22 +298,23 @@ def fetch_snapshot(
         raise SnapshotRetryableError(
             f"URL error while fetching snapshot from {snapshot_url}: {error.reason}"
         ) from error
+    except TimeoutError as error:
+        raise SnapshotRetryableError(f"Timeout while fetching snapshot from {snapshot_url}") from error
+    except OSError as error:
+        raise SnapshotRetryableError(f"OS error while fetching snapshot from {snapshot_url}: {error}") from error
 
     if not image_bytes:
         raise SnapshotRetryableError(f"Empty snapshot response from {snapshot_url}")
     return image_bytes
 
 
-def fetch_and_assess_snapshot(
+def fetch_snapshot_with_retries(
     snapshot_url: str,
     credentials: CaptureCredentials,
     *,
     timeout_seconds: float,
-    night_median_threshold: float,
-    night_dark_ratio_threshold: float,
-    dark_pixel_threshold: int,
-) -> SnapshotAssessment:
-    """Fetch a valid snapshot with exponential backoff.
+) -> bytes:
+    """Fetch raw snapshot bytes with exponential backoff.
 
     Parameters
     ----------
@@ -313,23 +324,16 @@ def fetch_and_assess_snapshot(
         Digest-auth username and password.
     timeout_seconds: float
         Network timeout in seconds for each attempt.
-    night_median_threshold: float
-        Median luminance below which the image is tagged as night.
-    night_dark_ratio_threshold: float
-        Dark-pixel ratio above which the image is tagged as night.
-    dark_pixel_threshold: int
-        Luminance threshold used to count dark pixels.
 
     Returns
     -------
-    SnapshotAssessment
-        Raw snapshot bytes and D/N assessment.
+    bytes
+        Raw snapshot image bytes.
 
     Raises
     ------
     SnapshotRetryableError
-        If all attempts fail due to fetch errors, empty responses, or invalid
-        image bytes.
+        If all attempts fail due to fetch errors or empty responses.
     """
 
     retryer = Retrying(
@@ -344,23 +348,10 @@ def fetch_and_assess_snapshot(
     )
     for attempt in retryer:
         with attempt:
-            image_bytes = fetch_snapshot(
+            return fetch_snapshot(
                 snapshot_url,
                 credentials,
                 timeout_seconds=timeout_seconds,
-            )
-            try:
-                day_night_assessment = assess_day_night_from_image_bytes(
-                    image_bytes,
-                    night_median_threshold=night_median_threshold,
-                    night_dark_ratio_threshold=night_dark_ratio_threshold,
-                    dark_pixel_threshold=dark_pixel_threshold,
-                )
-            except RuntimeError as error:
-                raise SnapshotRetryableError(str(error)) from error
-            return SnapshotAssessment(
-                image_bytes=image_bytes,
-                day_night_assessment=day_night_assessment,
             )
 
     raise SnapshotRetryableError(f"Snapshot retry loop exited unexpectedly: {snapshot_url}")
@@ -411,7 +402,6 @@ def get_province_abbr(province_name: str, *, old_province_abbr: bool) -> str:
 def build_filename(
     camera_site: CameraSite,
     captured_at: datetime,
-    image_tag: DayNightTag,
     *,
     old_province_abbr: bool,
 ) -> str:
@@ -423,15 +413,13 @@ def build_filename(
         Camera endpoint metadata.
     captured_at: datetime
         Local capture timestamp.
-    image_tag: DayNightTag
-        Image-content-derived D/N tag.
     old_province_abbr: bool
         Whether to use the old province mapping.
 
     Returns
     -------
     str
-        Filename using ``<province>-<site>-<YYYYMMDD>_<HHMMSS>_<D|N>.jpg``.
+        Filename using ``<province>-<site>-<YYYYMMDD>_<HHMMSS>.jpg``.
     """
 
     province_name = get_province_name(
@@ -440,7 +428,7 @@ def build_filename(
     )
     province_abbr = get_province_abbr(province_name, old_province_abbr=old_province_abbr)
     timestamp_text = captured_at.strftime("%Y%m%d_%H%M%S")
-    return f"{province_abbr}-{camera_site.site_code}-{timestamp_text}_{image_tag}.jpg"
+    return f"{province_abbr}-{camera_site.site_code}-{timestamp_text}.jpg"
 
 
 def append_capture_record(log_path: Path, record: CaptureRecord) -> None:
@@ -463,24 +451,15 @@ def append_capture_record(log_path: Path, record: CaptureRecord) -> None:
         writer.writerow(asdict(record))
 
 
-def capture_camera_snapshot(
+def capture_raw_snapshot(
     camera_key: str,
     credentials: CaptureCredentials,
     *,
     camera_sites: Mapping[str, CameraSite],
-    output_dir: Path,
-    log_path: Path,
     channel: int | None,
-    old_province_abbr: bool,
     timeout_seconds: float,
-    day_start_hour: int,
-    day_end_hour: int,
-    night_median_threshold: float,
-    night_dark_ratio_threshold: float,
-    dark_pixel_threshold: int,
-    overwrite: bool,
-) -> CaptureRecord:
-    """Capture one camera snapshot, save it, and append a CSV record.
+) -> RawSnapshotCapture:
+    """Download one raw camera snapshot.
 
     Parameters
     ----------
@@ -490,16 +469,58 @@ def capture_camera_snapshot(
         Digest-auth username and password.
     camera_sites: Mapping[str, CameraSite]
         Camera site metadata keyed by camera key.
-    output_dir: Path
-        Directory where image files are saved.
-    log_path: Path
-        CSV log path.
     channel: int | None
         Channel override. If omitted, the camera default channel is used.
-    old_province_abbr: bool
-        Whether to use old province abbreviations.
     timeout_seconds: float
         Network timeout in seconds.
+
+    Returns
+    -------
+    RawSnapshotCapture
+        Raw snapshot bytes and capture metadata.
+    """
+
+    camera_site = camera_sites[camera_key]
+    selected_channel = camera_site.default_channel if channel is None else channel
+    captured_at = datetime.now()
+    snapshot_url = build_snapshot_url(camera_site, selected_channel)
+    image_bytes = fetch_snapshot_with_retries(
+        snapshot_url,
+        credentials,
+        timeout_seconds=timeout_seconds,
+    )
+
+    return RawSnapshotCapture(
+        camera_key=camera_key,
+        camera_site=camera_site,
+        channel=selected_channel,
+        captured_at=captured_at,
+        image_bytes=image_bytes,
+    )
+
+
+def assess_and_save_capture(
+    raw_capture: RawSnapshotCapture,
+    *,
+    output_dir: Path,
+    old_province_abbr: bool,
+    day_start_hour: int,
+    day_end_hour: int,
+    night_median_threshold: float,
+    night_dark_ratio_threshold: float,
+    dark_pixel_threshold: int,
+    overwrite: bool,
+) -> CaptureRecord:
+    """Assess a raw snapshot, save it, and build a CSV record.
+
+    Parameters
+    ----------
+    raw_capture: RawSnapshotCapture
+        Downloaded snapshot bytes and capture metadata.
+    output_dir: Path
+        Directory where image files are saved.
+    old_province_abbr: bool
+        Whether to use old province abbreviations.
     day_start_hour: int
         Inclusive local hour when daytime begins.
     day_end_hour: int
@@ -519,20 +540,14 @@ def capture_camera_snapshot(
         Saved snapshot metadata and D/N diagnostics.
     """
 
-    camera_site = camera_sites[camera_key]
-    selected_channel = camera_site.default_channel if channel is None else channel
-    captured_at = datetime.now()
-    snapshot_url = build_snapshot_url(camera_site, selected_channel)
-    snapshot_assessment = fetch_and_assess_snapshot(
-        snapshot_url,
-        credentials,
-        timeout_seconds=timeout_seconds,
+    camera_site = raw_capture.camera_site
+    captured_at = raw_capture.captured_at
+    day_night_assessment = assess_day_night_from_image_bytes(
+        raw_capture.image_bytes,
         night_median_threshold=night_median_threshold,
         night_dark_ratio_threshold=night_dark_ratio_threshold,
         dark_pixel_threshold=dark_pixel_threshold,
     )
-    image_bytes = snapshot_assessment.image_bytes
-    day_night_assessment = snapshot_assessment.day_night_assessment
     time_tag = get_time_tag(
         captured_at,
         day_start_hour=day_start_hour,
@@ -554,14 +569,13 @@ def capture_camera_snapshot(
     filename = build_filename(
         camera_site,
         captured_at,
-        day_night_assessment.image_tag,
         old_province_abbr=old_province_abbr,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / filename
     if output_path.exists() and not overwrite:
         raise RuntimeError(f"Output file already exists: {output_path}")
-    output_path.write_bytes(image_bytes)
+    output_path.write_bytes(raw_capture.image_bytes)
 
     province_name = get_province_name(
         camera_site,
@@ -570,9 +584,9 @@ def capture_camera_snapshot(
     province_abbr = get_province_abbr(province_name, old_province_abbr=old_province_abbr)
     record = CaptureRecord(
         filename=filename,
-        camera_key=camera_key,
+        camera_key=raw_capture.camera_key,
         base_url=camera_site.base_url,
-        channel=selected_channel,
+        channel=raw_capture.channel,
         captured_at=captured_at.isoformat(timespec="seconds"),
         old_province_abbr=old_province_abbr,
         province_name=province_name,
@@ -587,6 +601,46 @@ def capture_camera_snapshot(
         dark_ratio=round(day_night_assessment.dark_ratio, 6),
         image_width=day_night_assessment.image_width,
         image_height=day_night_assessment.image_height,
+    )
+    return record
+
+
+def capture_camera_snapshot(
+    camera_key: str,
+    credentials: CaptureCredentials,
+    *,
+    camera_sites: Mapping[str, CameraSite],
+    output_dir: Path,
+    log_path: Path,
+    channel: int | None,
+    old_province_abbr: bool,
+    timeout_seconds: float,
+    day_start_hour: int,
+    day_end_hour: int,
+    night_median_threshold: float,
+    night_dark_ratio_threshold: float,
+    dark_pixel_threshold: int,
+    overwrite: bool,
+) -> CaptureRecord:
+    """Capture one camera snapshot, save it, and append a CSV record."""
+
+    raw_capture = capture_raw_snapshot(
+        camera_key,
+        credentials,
+        camera_sites=camera_sites,
+        channel=channel,
+        timeout_seconds=timeout_seconds,
+    )
+    record = assess_and_save_capture(
+        raw_capture,
+        output_dir=output_dir,
+        old_province_abbr=old_province_abbr,
+        day_start_hour=day_start_hour,
+        day_end_hour=day_end_hour,
+        night_median_threshold=night_median_threshold,
+        night_dark_ratio_threshold=night_dark_ratio_threshold,
+        dark_pixel_threshold=dark_pixel_threshold,
+        overwrite=overwrite,
     )
     append_capture_record(log_path, record)
     return record
@@ -675,6 +729,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help=f"Network timeout in seconds. Default: {TIMEOUT_SECONDS}.",
     )
     parser.add_argument(
+        "--capture-workers",
+        type=int,
+        help=f"Maximum parallel snapshot downloads. Default: {CAPTURE_WORKERS}.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite an existing image filename if it already exists.",
@@ -729,6 +788,24 @@ def validate_channel_argument(channel: int | None) -> None:
         raise ValueError("--channel must be at least 1")
 
 
+def validate_capture_workers(capture_workers: int) -> None:
+    """Validate the parallel capture worker count.
+
+    Parameters
+    ----------
+    capture_workers: int
+        Maximum number of concurrent snapshot downloads.
+
+    Raises
+    ------
+    ValueError
+        If the worker count is smaller than ``1``.
+    """
+
+    if capture_workers < 1:
+        raise ValueError("--capture-workers must be at least 1")
+
+
 def print_camera_list(camera_sites: Mapping[str, CameraSite], *, old_province_abbr: bool) -> None:
     """Print configured camera keys and filename prefixes.
 
@@ -748,7 +825,8 @@ def print_camera_list(camera_sites: Mapping[str, CameraSite], *, old_province_ab
             old_province_abbr=old_province_abbr,
         )
         prefix = f"{province_abbr}-{camera_site.site_code}"
-        print(f"{camera_key}\t{prefix}\t{camera_site.base_url}")
+        active_text = "active" if camera_site.is_active else "inactive"
+        print(f"{camera_key}\t{prefix}\t{active_text}\t{camera_site.base_url}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -782,11 +860,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     dark_pixel_threshold = DARK_PIXEL_THRESHOLD if args.dark_pixel_threshold is None else args.dark_pixel_threshold
     timeout_seconds = TIMEOUT_SECONDS if args.timeout_seconds is None else args.timeout_seconds
+    capture_workers = CAPTURE_WORKERS if args.capture_workers is None else args.capture_workers
 
     try:
         camera_sites = load_camera_sites(site_config_path)
         validate_hour_arguments(day_start_hour, day_end_hour)
         validate_channel_argument(args.channel)
+        validate_capture_workers(capture_workers)
     except ValueError as error:
         parser.error(str(error))
 
@@ -804,19 +884,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as error:
         parser.error(str(error))
 
-    camera_keys = tuple(camera_sites) if args.camera == "all" else (args.camera,)
+    if args.camera == "all":
+        camera_keys = tuple(camera_key for camera_key, camera_site in camera_sites.items() if camera_site.is_active)
+    else:
+        camera_keys = (args.camera,)
+    if not camera_keys:
+        parser.error("No active camera sites are configured")
+
+    raw_captures: list[RawSnapshotCapture] = []
     failed_count = 0
-    for camera_key in camera_keys:
-        try:
-            record = capture_camera_snapshot(
+    max_workers = min(capture_workers, len(camera_keys))
+    capture_futures: dict[Future[RawSnapshotCapture], str] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for camera_key in camera_keys:
+            future = executor.submit(
+                capture_raw_snapshot,
                 camera_key,
                 credentials,
                 camera_sites=camera_sites,
-                output_dir=output_dir,
-                log_path=log_path,
                 channel=args.channel,
-                old_province_abbr=args.old_province_abbr,
                 timeout_seconds=timeout_seconds,
+            )
+            capture_futures[future] = camera_key
+
+        for future in as_completed(capture_futures):
+            camera_key = capture_futures[future]
+            try:
+                raw_captures.append(future.result())
+            except RuntimeError as error:
+                failed_count += 1
+                print(f"{camera_key}: {error}", file=sys.stderr)
+
+    for raw_capture in raw_captures:
+        try:
+            record = assess_and_save_capture(
+                raw_capture,
+                output_dir=output_dir,
+                old_province_abbr=args.old_province_abbr,
                 day_start_hour=day_start_hour,
                 day_end_hour=day_end_hour,
                 night_median_threshold=night_median_threshold,
@@ -826,8 +930,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         except RuntimeError as error:
             failed_count += 1
-            print(f"{camera_key}: {error}", file=sys.stderr)
+            print(f"{raw_capture.camera_key}: {error}", file=sys.stderr)
             continue
+        append_capture_record(log_path, record)
         review_text = " review_flag=true" if record.review_flag else ""
         print(f"saved {record.filename}{review_text}")
 

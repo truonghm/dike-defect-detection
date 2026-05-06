@@ -1,15 +1,13 @@
 """Command-line interface for standalone image assessment."""
 
 # TODO: implement separate blur thresholds for day and night images.
-# TODO: extract the capture-filename D/N parser into the `dataset` subpackage
-# once it gains other consumers.
 
 from __future__ import annotations
 
 import argparse
 import csv
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -26,7 +24,8 @@ from dike_defect_detection.image_assessment.constants import (
     NIGHT_DARK_RATIO_THRESHOLD,
     NIGHT_MEDIAN_THRESHOLD,
 )
-from dike_defect_detection.image_assessment.day_night import assess_day_night_from_image_bytes
+from dike_defect_detection.image_assessment.day_night import DayNightTag, assess_day_night_from_image_bytes
+from dike_defect_detection.image_assessment.metadata import load_image_tag_metadata
 from dike_defect_detection.image_assessment.resolution import assess_resolution
 
 AssessmentCheck = Literal["day_night", "resolution", "blur"]
@@ -204,6 +203,28 @@ def get_image_size(image_path: Path) -> tuple[int, int]:
         raise RuntimeError(str(error)) from error
 
 
+def load_image_tag_metadata_by_directory(image_paths: Sequence[Path]) -> dict[Path, dict[str, DayNightTag]]:
+    """Load capture metadata once for each image parent directory.
+
+    Parameters
+    ----------
+    image_paths: Sequence[Path]
+        Image paths to assess.
+
+    Returns
+    -------
+    dict[Path, dict[str, DayNightTag]]
+        Mapping from image directory to filename-level D/N metadata.
+    """
+
+    metadata_by_directory: dict[Path, dict[str, DayNightTag]] = {}
+    for image_path in image_paths:
+        directory = image_path.parent
+        if directory not in metadata_by_directory:
+            metadata_by_directory[directory] = load_image_tag_metadata(directory)
+    return metadata_by_directory
+
+
 def build_error_record(
     image_path: Path,
     checks: Sequence[AssessmentCheck],
@@ -260,6 +281,7 @@ def assess_image_path(
     checks: Sequence[AssessmentCheck],
     *,
     blur_threshold: float,
+    image_tag_metadata: Mapping[str, DayNightTag],
 ) -> ImageAssessmentRecord:
     """Assess one local image path.
 
@@ -271,6 +293,9 @@ def assess_image_path(
         Checks to run.
     blur_threshold: float
         Blur-effect score above which the image is flagged as blurred.
+    image_tag_metadata: Mapping[str, DayNightTag]
+        D/N metadata keyed by image filename, usually loaded from
+        ``camera_capture_log.csv`` in the image directory.
 
     Returns
     -------
@@ -328,12 +353,8 @@ def assess_image_path(
         dark_ratio = f"{day_night_assessment.dark_ratio:.6f}"
         image_width = str(day_night_assessment.image_width)
         image_height = str(day_night_assessment.image_height)
-
-    if not image_tag:
-        if image_path.stem.endswith("_N"):
-            image_tag = "N"
-        elif image_path.stem.endswith("_D"):
-            image_tag = "D"
+    else:
+        image_tag = image_tag_metadata.get(image_path.name, "")
 
     if "resolution" in checks:
         if image_width and image_height:
@@ -441,7 +462,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     checks: tuple[AssessmentCheck, ...] = tuple(args.checks or AVAILABLE_CHECKS)
     blur_threshold = BLUR_THRESHOLD if args.blur_threshold is None else args.blur_threshold
     image_paths = expand_input_paths(args.paths)
-    records = [assess_image_path(image_path, checks, blur_threshold=blur_threshold) for image_path in image_paths]
+    try:
+        image_tag_metadata_by_directory = load_image_tag_metadata_by_directory(image_paths)
+    except ValueError as error:
+        parser.error(str(error))
+    records = [
+        assess_image_path(
+            image_path,
+            checks,
+            blur_threshold=blur_threshold,
+            image_tag_metadata=image_tag_metadata_by_directory[image_path.parent],
+        )
+        for image_path in image_paths
+    ]
     write_csv(records)
     return 0
 

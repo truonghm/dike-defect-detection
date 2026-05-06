@@ -3,13 +3,13 @@
 Capture KBVISION camera snapshots and save them with the project filename convention:
 
 ```text
-<PROVINCE>-<SITE>-<YYYYMMDD>_<HHMMSS>_<D|N>.jpg
+<PROVINCE>-<SITE>-<YYYYMMDD>_<HHMMSS>.jpg
 ```
 
 Example:
 
 ```text
-TB-KTT-20260505_091530_D.jpg
+TB-ketanthanh-20260505_091530.jpg
 ```
 
 ## Credentials
@@ -33,6 +33,12 @@ Alternative: pass credentials directly with CLI flags. CLI flags override enviro
 uv run python -m dike_defect_detection.camera_capture --list-cameras
 ```
 
+The output columns are:
+
+```text
+camera_key  filename_prefix  active_status  base_url
+```
+
 ## Site Config
 
 Default site config:
@@ -47,12 +53,15 @@ Each site entry uses this shape:
 {
   "camera_key": "ketanthanh",
   "base_url": "http://ketanthanh.kbvision.tv:8081/",
-  "site_code": "KTT",
+  "site_code": "ketanthanh",
   "old_province_name": "Thai Binh",
   "new_province_name": "Hung Yen",
-  "default_channel": 1
+  "default_channel": 1,
+  "is_active": true
 }
 ```
+
+`--camera all` captures only sites with `is_active: true`. An explicit `--camera <camera_key>` can still be used to test an inactive site.
 
 Use a custom site config:
 
@@ -84,6 +93,16 @@ uv run python -m dike_defect_detection.camera_capture \
 ```bash
 uv run python -m dike_defect_detection.camera_capture --camera all
 ```
+
+By default, raw snapshot downloads run concurrently before image assessment and CSV logging. Tune the capture concurrency:
+
+```bash
+uv run python -m dike_defect_detection.camera_capture \
+  --camera all \
+  --capture-workers 16
+```
+
+Image assessment, file saving, and CSV writes run after the raw download phase, so CSV writes are serialized.
 
 ## Output Directory
 
@@ -123,7 +142,6 @@ Snapshot fetches are retried automatically for transient failures:
 
 ```text
 empty response
-invalid image response
 HTTP/URL fetch error
 ```
 
@@ -143,9 +161,9 @@ uv run python -m dike_defect_detection.camera_capture \
 
 ## Day/Night Review Flags
 
-The filename uses the image-based `D` or `N` tag.
+The filename does not contain a day/night tag. The CSV log stores both the image-based `image_tag` and timestamp-based `time_tag`.
 
-The CSV log compares this against local timestamp-based expectation. If they disagree, the row has:
+The CSV log compares these tags. If they disagree, the row has:
 
 ```text
 review_flag=true

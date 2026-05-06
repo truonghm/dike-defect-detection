@@ -4,30 +4,17 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any
 
-from dike_defect_detection.scene_understanding.groups import build_scene_group_masks
-from dike_defect_detection.scene_understanding.io import (
-    build_output_paths,
-    collect_image_paths,
-    save_label_mask,
-    write_json,
+from dike_defect_detection.scene_understanding.io import collect_image_paths
+from dike_defect_detection.scene_understanding.oneformer import DEFAULT_ONEFORMER_MODEL
+from dike_defect_detection.scene_understanding.processing import (
+    DEFAULT_MAX_SIDE,
+    DEFAULT_OUTPUT_DIR,
+    DEFAULT_TOP_LABELS,
+    run_scene_understanding_for_paths,
 )
-from dike_defect_detection.scene_understanding.labels import LabelSummary
-from dike_defect_detection.scene_understanding.metrics import compute_scene_metrics
-from dike_defect_detection.scene_understanding.oneformer import DEFAULT_ONEFORMER_MODEL, OneFormerSceneParser
-from dike_defect_detection.scene_understanding.overlay import build_overlay_exclusion_mask
-from dike_defect_detection.scene_understanding.usability import SCORE_PRECISION
-from dike_defect_detection.scene_understanding.visualization import build_semantic_overlay
-from dike_defect_detection.synthesis.suitability import assess_synthesis_suitability
 
-DEFAULT_OUTPUT_DIR = Path("outputs/scene_understanding")
-DEFAULT_MAX_SIDE = 1024
-DEFAULT_TOP_LABELS = 15
-ONEFORMER_OUTPUTS_FILENAME = "oneformer_outputs.json"
-SCENE_ASSESSMENT_FILENAME = "scene_assessment.json"
 DISPLAY_SECONDS_PRECISION = 2
 DISPLAY_SCORE_PRECISION = 3
 DISPLAY_RATIO_PRECISION = 3
@@ -83,25 +70,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def label_summaries_to_json(label_summaries: Sequence[LabelSummary], max_items: int) -> list[dict[str, Any]]:
-    """Convert label summaries to JSON-serializable records.
-
-    Parameters
-    ----------
-    label_summaries: Sequence[LabelSummary]
-        Label summary records.
-    max_items: int
-        Maximum number of summaries to include.
-
-    Returns
-    -------
-    list[dict[str, Any]]
-        JSON records.
-    """
-
-    return [asdict(summary) for summary in label_summaries[:max_items]]
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the scene-understanding CLI.
 
@@ -130,86 +98,49 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         image_paths = collect_image_paths(args.path)
-        scene_parser = OneFormerSceneParser(model_name, device_name=args.device, use_amp=not args.no_amp)
+        run_result = run_scene_understanding_for_paths(
+            image_paths,
+            output_dir,
+            model_name=model_name,
+            max_side=max_side,
+            device_name=args.device,
+            use_amp=not args.no_amp,
+            top_labels=top_labels,
+        )
     except RuntimeError as error:
         parser.error(str(error))
     except ValueError as error:
         parser.error(str(error))
 
-    oneformer_outputs: dict[str, dict[str, str]] = {}
-    scene_assessment: dict[str, dict[str, Any]] = {}
-    total_inference_seconds = 0.0
-
-    print(f"model={scene_parser.model_name}")
-    print(f"device={scene_parser.device_text}")
-    if scene_parser.cuda_name:
-        print(f"cuda_name={scene_parser.cuda_name}")
-    print(f"amp={scene_parser.use_amp}")
-    print(f"load_seconds={scene_parser.load_seconds:.2f}")
+    print(f"model={run_result.model_name}")
+    print(f"device={run_result.device_text}")
+    if run_result.cuda_name:
+        print(f"cuda_name={run_result.cuda_name}")
+    print(f"amp={run_result.use_amp}")
+    print(f"load_seconds={run_result.load_seconds:.2f}")
     print(f"images={len(image_paths)}")
 
-    for image_path in image_paths:
-        result = scene_parser.segment_image(image_path, max_side=max_side)
-        total_inference_seconds += result.inference_seconds
-        mask_path, overlay_path = build_output_paths(output_dir, image_path)
-
-        overlay_mask = build_overlay_exclusion_mask(result.label_mask.shape[0], result.label_mask.shape[1])
-        group_masks = build_scene_group_masks(result.label_mask, result.id_to_label, overlay_mask)
-        metrics = compute_scene_metrics(group_masks)
-        synthesis_suitability = assess_synthesis_suitability(metrics)
-
-        save_label_mask(result.label_mask, mask_path)
-        overlay_image = build_semantic_overlay(
-            result.image,
-            result.label_mask,
-            result.id_to_label,
-            result.label_summaries,
-        )
-        overlay_path.parent.mkdir(parents=True, exist_ok=True)
-        overlay_image.save(overlay_path, quality=92)
-
-        input_key = str(image_path.resolve())
-        oneformer_outputs[input_key] = {
-            "mask_path": str(mask_path.resolve()),
-            "overlay_path": str(overlay_path.resolve()),
-        }
-        scene_assessment[input_key] = {
-            "mask_path": str(mask_path.resolve()),
-            "overlay_path": str(overlay_path.resolve()),
-            "processed_image_width": result.image.width,
-            "processed_image_height": result.image.height,
-            "inference_seconds": round(result.inference_seconds, SCORE_PRECISION),
-            "top_labels": label_summaries_to_json(result.label_summaries, top_labels),
-            "metrics": asdict(metrics),
-            "synthesis_suitability": {
-                defect_class: asdict(decision) for defect_class, decision in synthesis_suitability.items()
-            },
-        }
-
-        print(f"\nimage={image_path}")
-        print(f"inference_seconds={result.inference_seconds:.{DISPLAY_SECONDS_PRECISION}f}")
-        print(f"mask={mask_path}")
-        print(f"overlay={overlay_path}")
+    for image_result in run_result.image_results:
+        print(f"\nimage={image_result.image_path}")
+        print(f"inference_seconds={image_result.inference_seconds:.{DISPLAY_SECONDS_PRECISION}f}")
+        print(f"mask={image_result.mask_path}")
+        print(f"overlay={image_result.overlay_path}")
         print("synthesis_suitability")
-        for defect_class, decision in synthesis_suitability.items():
+        for defect_class, decision in image_result.synthesis_suitability.items():
             print(
                 f"{defect_class}\t{decision.status}\t"
                 f"{decision.score:.{DISPLAY_SCORE_PRECISION}f}\t{';'.join(decision.reasons)}"
             )
         print("top_labels")
-        for summary in result.label_summaries[:top_labels]:
+        for summary in image_result.label_summaries[:top_labels]:
             print(
                 f"{summary.label_id:3d}\t{summary.area_ratio:.{DISPLAY_RATIO_PRECISION}f}\t"
                 f"RGB{summary.color}\t{summary.label}"
             )
 
-    oneformer_outputs_path = output_dir / ONEFORMER_OUTPUTS_FILENAME
-    scene_assessment_path = output_dir / SCENE_ASSESSMENT_FILENAME
-    write_json(oneformer_outputs_path, oneformer_outputs)
-    write_json(scene_assessment_path, scene_assessment)
-    print(f"\noneformer_outputs={oneformer_outputs_path}")
-    print(f"scene_assessment={scene_assessment_path}")
-    print(f"total_inference_seconds={total_inference_seconds:.{DISPLAY_SECONDS_PRECISION}f}")
+    print(f"\noneformer_outputs={run_result.oneformer_outputs_path}")
+    print(f"scene_assessment={run_result.scene_assessment_path}")
+    print(f"total_inference_seconds={run_result.total_inference_seconds:.{DISPLAY_SECONDS_PRECISION}f}")
     return 0
 
 

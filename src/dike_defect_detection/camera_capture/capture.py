@@ -44,7 +44,9 @@ from dike_defect_detection.camera_capture.mappings import (
     CameraSite,
     load_camera_sites,
 )
+from dike_defect_detection.image_assessment.blur import assess_blur_from_image_bytes
 from dike_defect_detection.image_assessment.constants import (
+    BLUR_THRESHOLD,
     DARK_PIXEL_THRESHOLD,
     DAY_END_HOUR,
     DAY_START_HOUR,
@@ -59,6 +61,13 @@ from dike_defect_detection.image_assessment.day_night import (
     get_time_tag,
 )
 from dike_defect_detection.image_assessment.resolution import assess_resolution
+from dike_defect_detection.scene_understanding.processing import (
+    run_scene_understanding_for_paths,
+    write_scene_understanding_error,
+)
+
+SCENE_UNDERSTANDING_DIR_NAME = "scene_understanding"
+SCENE_UNDERSTANDING_RUN_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
 
 CSV_FIELDS: tuple[str, ...] = (
     "filename",
@@ -79,6 +88,9 @@ CSV_FIELDS: tuple[str, ...] = (
     "dark_ratio",
     "image_width",
     "image_height",
+    "blur_score",
+    "blur_threshold",
+    "blur_valid",
 )
 
 
@@ -169,6 +181,12 @@ class CaptureRecord:
         Original image width in pixels.
     image_height: int
         Original image height in pixels.
+    blur_score: str
+        Blur-effect score for day images. Empty for night images.
+    blur_threshold: str
+        Blur-effect threshold used for day images. Empty for night images.
+    blur_valid: str
+        Whether the image is sharper than the blur threshold. Empty for night images.
     """
 
     filename: str
@@ -189,6 +207,9 @@ class CaptureRecord:
     dark_ratio: float
     image_width: int
     image_height: int
+    blur_score: str
+    blur_threshold: str
+    blur_valid: str
 
 
 def build_snapshot_url(camera_site: CameraSite, channel: int) -> str:
@@ -443,12 +464,115 @@ def append_capture_record(log_path: Path, record: CaptureRecord) -> None:
     """
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    should_write_header = not log_path.exists()
+    existing_fields = read_existing_csv_fields(log_path)
+    fieldnames = existing_fields or CSV_FIELDS
+    should_write_header = existing_fields is None
     with log_path.open("a", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+        writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
         if should_write_header:
             writer.writeheader()
         writer.writerow(asdict(record))
+
+
+def read_existing_csv_fields(log_path: Path) -> tuple[str, ...] | None:
+    """Read an existing CSV header, if the log already has one.
+
+    Parameters
+    ----------
+    log_path: Path
+        CSV log path.
+
+    Returns
+    -------
+    tuple[str, ...] | None
+        Existing field names, or ``None`` when the file is absent or empty.
+    """
+
+    if not log_path.exists() or log_path.stat().st_size == 0:
+        return None
+    with log_path.open("r", newline="", encoding="utf-8") as file:
+        reader = csv.reader(file)
+        header = next(reader, None)
+    if not header:
+        return None
+    return tuple(header)
+
+
+def build_scene_understanding_output_dir(capture_output_dir: Path, run_started_at: datetime) -> Path:
+    """Build the fixed scene-understanding output directory for one capture run.
+
+    Parameters
+    ----------
+    capture_output_dir: Path
+        Directory where camera snapshots are saved.
+    run_started_at: datetime
+        Timestamp assigned to the camera-capture run.
+
+    Returns
+    -------
+    Path
+        ``<capture-output-parent>/scene_understanding/<YYYYMMDD_HHMMSS>``.
+    """
+
+    timestamp_text = run_started_at.strftime(SCENE_UNDERSTANDING_RUN_TIMESTAMP_FORMAT)
+    return capture_output_dir.parent / SCENE_UNDERSTANDING_DIR_NAME / timestamp_text
+
+
+def collect_day_capture_paths(records: Sequence[CaptureRecord], output_dir: Path) -> list[Path]:
+    """Collect saved day-image paths from the current capture run.
+
+    Parameters
+    ----------
+    records: Sequence[CaptureRecord]
+        Capture records saved during the current CLI invocation.
+    output_dir: Path
+        Directory where camera snapshots are saved.
+
+    Returns
+    -------
+    list[Path]
+        Paths for records whose image-content tag is ``D``.
+    """
+
+    return [output_dir / record.filename for record in records if record.image_tag == "D"]
+
+
+def run_scene_understanding_for_capture_records(
+    records: Sequence[CaptureRecord],
+    *,
+    capture_output_dir: Path,
+    run_started_at: datetime,
+) -> bool:
+    """Run scene understanding for current-run day captures.
+
+    Parameters
+    ----------
+    records: Sequence[CaptureRecord]
+        Capture records saved during the current CLI invocation.
+    capture_output_dir: Path
+        Directory where camera snapshots are saved.
+    run_started_at: datetime
+        Timestamp assigned to the camera-capture run.
+
+    Returns
+    -------
+    bool
+        ``True`` when scene understanding completed and wrote its JSON files.
+    """
+
+    scene_output_dir = build_scene_understanding_output_dir(capture_output_dir, run_started_at)
+    day_image_paths = collect_day_capture_paths(records, capture_output_dir)
+    try:
+        result = run_scene_understanding_for_paths(day_image_paths, scene_output_dir)
+    except Exception as error:
+        write_scene_understanding_error(scene_output_dir, day_image_paths, str(error))
+        print(f"scene_understanding_failed output_dir={scene_output_dir} error={error}", file=sys.stderr)
+        return False
+
+    print(f"scene_understanding_output_dir={result.output_dir}")
+    print(f"scene_understanding_images={len(day_image_paths)}")
+    print(f"scene_assessment={result.scene_assessment_path}")
+    return True
 
 
 def capture_raw_snapshot(
@@ -509,6 +633,7 @@ def assess_and_save_capture(
     night_median_threshold: float,
     night_dark_ratio_threshold: float,
     dark_pixel_threshold: int,
+    blur_threshold: float,
     overwrite: bool,
 ) -> CaptureRecord:
     """Assess a raw snapshot, save it, and build a CSV record.
@@ -531,6 +656,8 @@ def assess_and_save_capture(
         Dark-pixel ratio above which the image is tagged as night.
     dark_pixel_threshold: int
         Luminance threshold used to count dark pixels.
+    blur_threshold: float
+        Blur-effect score above which day images are flagged as blurred.
     overwrite: bool
         Whether to overwrite an existing filename.
 
@@ -564,6 +691,23 @@ def assess_and_save_capture(
         review_reasons.append("time_image_disagree")
     if not resolution_assessment.is_valid:
         review_reasons.append("resolution_mismatch")
+    blur_score = ""
+    blur_threshold_text = ""
+    blur_valid = ""
+    if day_night_assessment.image_tag == "D":
+        blur_threshold_text = f"{blur_threshold}"
+        try:
+            blur_assessment = assess_blur_from_image_bytes(
+                raw_capture.image_bytes,
+                blur_threshold=blur_threshold,
+            )
+        except (OSError, RuntimeError):
+            review_reasons.append("blur_check_failed")
+        else:
+            blur_score = f"{blur_assessment.blur_score:.6f}"
+            blur_valid = str(blur_assessment.is_sharp)
+            if not blur_assessment.is_sharp:
+                review_reasons.append("blurred")
     review_flag = bool(review_reasons)
     review_reason = ";".join(review_reasons)
     filename = build_filename(
@@ -601,6 +745,9 @@ def assess_and_save_capture(
         dark_ratio=round(day_night_assessment.dark_ratio, 6),
         image_width=day_night_assessment.image_width,
         image_height=day_night_assessment.image_height,
+        blur_score=blur_score,
+        blur_threshold=blur_threshold_text,
+        blur_valid=blur_valid,
     )
     return record
 
@@ -620,6 +767,7 @@ def capture_camera_snapshot(
     night_median_threshold: float,
     night_dark_ratio_threshold: float,
     dark_pixel_threshold: int,
+    blur_threshold: float,
     overwrite: bool,
 ) -> CaptureRecord:
     """Capture one camera snapshot, save it, and append a CSV record."""
@@ -640,6 +788,7 @@ def capture_camera_snapshot(
         night_median_threshold=night_median_threshold,
         night_dark_ratio_threshold=night_dark_ratio_threshold,
         dark_pixel_threshold=dark_pixel_threshold,
+        blur_threshold=blur_threshold,
         overwrite=overwrite,
     )
     append_capture_record(log_path, record)
@@ -859,8 +1008,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         NIGHT_DARK_RATIO_THRESHOLD if args.night_dark_ratio_threshold is None else args.night_dark_ratio_threshold
     )
     dark_pixel_threshold = DARK_PIXEL_THRESHOLD if args.dark_pixel_threshold is None else args.dark_pixel_threshold
+    blur_threshold = BLUR_THRESHOLD
     timeout_seconds = TIMEOUT_SECONDS if args.timeout_seconds is None else args.timeout_seconds
     capture_workers = CAPTURE_WORKERS if args.capture_workers is None else args.capture_workers
+    run_started_at = datetime.now()
 
     try:
         camera_sites = load_camera_sites(site_config_path)
@@ -892,6 +1043,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("No active camera sites are configured")
 
     raw_captures: list[RawSnapshotCapture] = []
+    saved_records: list[CaptureRecord] = []
     failed_count = 0
     max_workers = min(capture_workers, len(camera_keys))
     capture_futures: dict[Future[RawSnapshotCapture], str] = {}
@@ -926,6 +1078,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 night_median_threshold=night_median_threshold,
                 night_dark_ratio_threshold=night_dark_ratio_threshold,
                 dark_pixel_threshold=dark_pixel_threshold,
+                blur_threshold=blur_threshold,
                 overwrite=args.overwrite,
             )
         except RuntimeError as error:
@@ -933,8 +1086,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"{raw_capture.camera_key}: {error}", file=sys.stderr)
             continue
         append_capture_record(log_path, record)
+        saved_records.append(record)
         review_text = " review_flag=true" if record.review_flag else ""
         print(f"saved {record.filename}{review_text}")
+
+    scene_understanding_ok = run_scene_understanding_for_capture_records(
+        saved_records,
+        capture_output_dir=output_dir,
+        run_started_at=run_started_at,
+    )
+    if not scene_understanding_ok:
+        failed_count += 1
 
     return 1 if failed_count else 0
 

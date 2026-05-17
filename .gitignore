@@ -9,6 +9,9 @@ data/*/*.sig
 data/*/*.obs
 data/*/*.MRK
 data/*/*.mrk
+data/*/*.json
+data/*/*.jsonl
+data/*/*/.csv
 
 # Python-generated files
 __pycache__/
